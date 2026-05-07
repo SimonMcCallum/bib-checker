@@ -76,6 +76,23 @@ def write_bib_field(bib_path: str, key: str, field: str, value: str) -> bool:
     return True
 
 
+def extract_citations_from_dir(tex_dir: str, exclude_dirs: tuple = ("Figures", "figures")) -> dict:
+    """Walk a directory for .tex files and merge their citation contexts.
+
+    Skips paths under any folder named in `exclude_dirs` (TikZ figure files
+    typically live in Figures/ and contain no citations worth merging).
+    """
+    citations: dict = {}
+    root = Path(tex_dir)
+    for tex_file in root.rglob("*.tex"):
+        # Skip excluded subtrees
+        if any(part in exclude_dirs for part in tex_file.relative_to(root).parts):
+            continue
+        for k, ctxs in extract_citations(str(tex_file)).items():
+            citations.setdefault(k, []).extend(ctxs)
+    return citations
+
+
 def extract_citations(tex_path: str) -> dict:
     """Extract citation contexts from a .tex file.
 

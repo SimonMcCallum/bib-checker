@@ -11,10 +11,61 @@ console = Console()
 CROSSREF_URL = "https://api.crossref.org/works"
 S2_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 S2_PAPER_URL = "https://api.semanticscholar.org/graph/v1/paper"
+OPENALEX_URL = "https://api.openalex.org/works"
 
 HEADERS = {
     "User-Agent": "bib-checker/0.1 (https://github.com/SimonMcCallum/bib-checker)"
 }
+
+
+def _decode_inverted_abstract(inv: dict | None) -> str:
+    """OpenAlex returns abstracts as {word: [positions]}; turn it back into text."""
+    if not inv:
+        return ""
+    positions = []
+    for word, idxs in inv.items():
+        for idx in idxs:
+            positions.append((idx, word))
+    positions.sort()
+    return " ".join(w for _, w in positions)
+
+
+def search_openalex(title: str, doi: str | None = None) -> dict | None:
+    """Search OpenAlex. Often has abstracts where Semantic Scholar doesn't,
+    especially for older / book-chapter / non-DOI works."""
+    try:
+        if doi:
+            resp = requests.get(
+                f"{OPENALEX_URL}/doi:{doi}", headers=HEADERS, timeout=15
+            )
+            if resp.status_code == 200:
+                item = resp.json()
+                return {
+                    "source": "openalex",
+                    "doi": (item.get("doi") or "").replace("https://doi.org/", ""),
+                    "title": item.get("title", ""),
+                    "year": str(item.get("publication_year", "")),
+                    "abstract": _decode_inverted_abstract(item.get("abstract_inverted_index")),
+                }
+
+        params = {"search": title, "per-page": 3}
+        resp = requests.get(OPENALEX_URL, params=params, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        items = resp.json().get("results", [])
+        for item in items:
+            oa_title = item.get("title", "") or ""
+            if _title_match(title, oa_title) > 0.6:
+                return {
+                    "source": "openalex",
+                    "doi": (item.get("doi") or "").replace("https://doi.org/", ""),
+                    "title": oa_title,
+                    "year": str(item.get("publication_year", "")),
+                    "abstract": _decode_inverted_abstract(item.get("abstract_inverted_index")),
+                }
+    except (requests.RequestException, KeyError, IndexError):
+        pass
+    return None
 
 
 def _normalize(s: str) -> str:
@@ -81,12 +132,17 @@ def search_crossref(title: str, doi: str = None) -> dict | None:
 
 
 def search_semantic_scholar(title: str) -> dict | None:
-    """Search Semantic Scholar for a paper. Returns best match or None."""
+    """Search Semantic Scholar for a paper. Returns best match or None.
+
+    Also returns the model-generated 'tldr' (1–2 sentence summary) when
+    available — this is often crisper signal than the full abstract for
+    claim-alignment scoring.
+    """
     try:
         params = {
             "query": title,
             "limit": 3,
-            "fields": "title,year,authors,abstract,externalIds",
+            "fields": "title,year,authors,abstract,tldr,externalIds",
         }
         resp = requests.get(
             S2_SEARCH_URL, params=params, headers=HEADERS, timeout=15
@@ -98,6 +154,7 @@ def search_semantic_scholar(title: str) -> dict | None:
         for paper in papers:
             s2_title = paper.get("title", "")
             if _title_match(title, s2_title) > 0.6:
+                tldr_obj = paper.get("tldr") or {}
                 return {
                     "source": "semantic_scholar",
                     "paper_id": paper.get("paperId", ""),
@@ -107,6 +164,7 @@ def search_semantic_scholar(title: str) -> dict | None:
                         a.get("name", "") for a in paper.get("authors", [])
                     ],
                     "abstract": paper.get("abstract", ""),
+                    "tldr": tldr_obj.get("text", "") if isinstance(tldr_obj, dict) else "",
                     "doi": (paper.get("externalIds") or {}).get("DOI", ""),
                 }
     except (requests.RequestException, KeyError, IndexError):
@@ -131,15 +189,16 @@ def verify_entry(key: str, entry: dict) -> dict:
         "year_match": False,
         "doi": "",
         "abstract": "",
+        "tldr": "",
     }
 
     if not title:
         result["note"] = "No title in bib entry"
         return result
 
-    # Try Semantic Scholar first (free, returns abstracts)
+    # Try Semantic Scholar first (free, often has abstracts for indexed papers)
     s2 = search_semantic_scholar(title)
-    if s2:
+    if s2 and (s2.get("abstract") or s2.get("tldr")):
         result["found"] = True
         result["source"] = "semantic_scholar"
         result["matched_title"] = s2["title"]
@@ -147,12 +206,40 @@ def verify_entry(key: str, entry: dict) -> dict:
         result["year_match"] = s2["year"] == year
         result["doi"] = s2.get("doi", "")
         result["abstract"] = s2.get("abstract", "")
+        result["tldr"] = s2.get("tldr", "")
         result["paper_id"] = s2.get("paper_id", "")
         return result
 
-    time.sleep(1)  # Rate limit
+    time.sleep(1)
 
-    # Fallback to CrossRef
+    # OpenAlex — best abstract coverage for older / non-DOI works
+    oa = search_openalex(title, doi=doi)
+    if oa and oa.get("abstract"):
+        result["found"] = True
+        result["source"] = "openalex"
+        result["matched_title"] = oa["title"]
+        result["matched_year"] = oa["year"]
+        result["year_match"] = oa["year"] == year
+        result["doi"] = oa.get("doi", "")
+        result["abstract"] = oa.get("abstract", "")
+        return result
+
+    # Either S2 or OpenAlex found the paper but neither had an abstract.
+    # Take whichever metadata we have rather than failing over to CrossRef alone.
+    if s2 or oa:
+        meta = s2 or oa
+        result["found"] = True
+        result["source"] = meta["source"]
+        result["matched_title"] = meta["title"]
+        result["matched_year"] = meta["year"]
+        result["year_match"] = meta["year"] == year
+        result["doi"] = meta.get("doi", "")
+        result["abstract"] = ""
+        return result
+
+    time.sleep(1)
+
+    # Final fallback: CrossRef metadata only (no abstracts)
     cr = search_crossref(title, doi=doi)
     if cr:
         result["found"] = True
@@ -163,7 +250,7 @@ def verify_entry(key: str, entry: dict) -> dict:
         result["doi"] = cr.get("doi", "")
         return result
 
-    result["note"] = "Not found in Semantic Scholar or CrossRef"
+    result["note"] = "Not found in Semantic Scholar, OpenAlex, or CrossRef"
     return result
 
 

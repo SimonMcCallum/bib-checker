@@ -10,12 +10,24 @@ from .verify import verify_entry
 console = Console()
 
 
-def fetch_and_add_abstracts(bib_path: str, delay: float = 1.0) -> dict:
-    """Fetch abstracts for all entries and write them into the bib file.
+def fetch_and_add_abstracts(
+    bib_path: str,
+    delay: float = 1.0,
+    cited_keys: set | None = None,
+) -> dict:
+    """Fetch abstracts (and Semantic Scholar tldrs) and write them into the bib.
+
+    If `cited_keys` is given, only entries whose keys are in that set will be
+    fetched — useful when a personal library is much larger than the citations
+    actually used by the paper under review.
 
     Returns summary stats: {added: int, skipped: int, not_found: int}.
     """
-    entries = parse_bib(bib_path)
+    all_entries = parse_bib(bib_path)
+    if cited_keys is not None:
+        entries = {k: v for k, v in all_entries.items() if k in cited_keys}
+    else:
+        entries = all_entries
     stats = {"added": 0, "skipped": 0, "not_found": 0, "total": len(entries)}
     today = date.today().isoformat()
 
@@ -31,19 +43,29 @@ def fetch_and_add_abstracts(bib_path: str, delay: float = 1.0) -> dict:
 
         result = verify_entry(key, entry)
 
-        if result["found"] and result["abstract"]:
-            abstract = result["abstract"]
-            write_bib_field(bib_path, key, "abstract", abstract)
+        if result["found"] and (result.get("abstract") or result.get("tldr")):
+            abstract = result.get("abstract", "")
+            tldr = result.get("tldr", "")
+            if abstract:
+                write_bib_field(bib_path, key, "abstract", abstract)
+            if tldr:
+                write_bib_field(bib_path, key, "tldr", tldr)
             annotation = f"Verified via {result['source']} on {today}"
             if result.get("doi"):
                 annotation += f". DOI: {result['doi']}"
             write_bib_field(bib_path, key, "annotation", annotation)
 
-            console.print(f"  [green]Added abstract ({len(abstract)} chars)[/green]")
+            tldr_note = f" + tldr ({len(tldr)} chars)" if tldr else ""
+            abs_note = f"abstract ({len(abstract)} chars)" if abstract else "tldr only"
+            console.print(f"  [green]Added {abs_note}{tldr_note}[/green]")
             stats["added"] += 1
 
             # Re-parse to pick up changes for subsequent entries
-            entries = parse_bib(bib_path)
+            all_entries = parse_bib(bib_path)
+            entries = (
+                {k: v for k, v in all_entries.items() if k in cited_keys}
+                if cited_keys is not None else all_entries
+            )
         elif result["found"]:
             console.print("  [yellow]Found but no abstract available[/yellow]")
             annotation = f"Verified via {result['source']} on {today} (no abstract)"
