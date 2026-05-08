@@ -76,6 +76,78 @@ def write_bib_field(bib_path: str, key: str, field: str, value: str) -> bool:
     return True
 
 
+def parse_bib_dir(bib_dir: str) -> dict:
+    """Merge every .bib file under a directory into one entries dict.
+
+    On duplicate keys, the first-seen entry wins (later ones are ignored
+    rather than silently overwriting earlier ones).
+    """
+    merged: dict = {}
+    root = Path(bib_dir)
+    for bib_file in sorted(root.rglob("*.bib")):
+        for k, v in parse_bib(str(bib_file)).items():
+            merged.setdefault(k, v)
+    return merged
+
+
+def find_bib_paths_from_tex(
+    tex_path: str,
+    exclude_dirs: tuple = ("Figures", "figures"),
+) -> list[Path]:
+    r"""Discover the .bib files actually referenced by the LaTeX source.
+
+    Scans every .tex file under tex_path for ``\bibliography{...}`` and
+    ``\addbibresource{...}`` commands, then resolves each referenced name
+    against the project tree. The same name may sit in a subfolder, so we
+    rglob the project root for the basename.
+
+    Returns a deduplicated list of resolved paths in the order they were
+    encountered.
+    """
+    p = Path(tex_path)
+    tex_root = p if p.is_dir() else p.parent
+    if p.is_file():
+        tex_files = [p]
+    else:
+        tex_files = [
+            t for t in p.rglob("*.tex")
+            if not any(part in exclude_dirs for part in t.relative_to(p).parts)
+        ]
+
+    requested: list[str] = []
+    for tex_file in tex_files:
+        try:
+            text = tex_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Strip line-comments so commented-out bibliography commands are ignored.
+        text = re.sub(r"(?<!\\)%.*$", "", text, flags=re.MULTILINE)
+        for m in re.finditer(r"\\bibliography\s*\{([^}]+)\}", text):
+            for name in m.group(1).split(","):
+                if name.strip():
+                    requested.append(name.strip())
+        for m in re.finditer(r"\\addbibresource\s*\{([^}]+)\}", text):
+            if m.group(1).strip():
+                requested.append(m.group(1).strip())
+
+    resolved: list[Path] = []
+    seen: set = set()
+    for name in requested:
+        bib_name = name if name.lower().endswith(".bib") else f"{name}.bib"
+        # First try relative-to-root, then a tree-wide search by basename.
+        candidates = [tex_root / bib_name, *tex_root.rglob(bib_name)]
+        for cand in candidates:
+            try:
+                key = cand.resolve()
+            except OSError:
+                continue
+            if cand.is_file() and key not in seen:
+                resolved.append(cand)
+                seen.add(key)
+                break
+    return resolved
+
+
 def extract_citations_from_dir(tex_dir: str, exclude_dirs: tuple = ("Figures", "figures")) -> dict:
     """Walk a directory for .tex files and merge their citation contexts.
 

@@ -23,6 +23,13 @@ import sys
 import traceback
 from pathlib import Path
 
+# `streamlit run gui.py` executes this file as a top-level script, so the
+# `bib_checker` package must be importable by absolute name. Prepend the
+# parent directory in case the user hasn't `pip install -e .`'d the project.
+_PKG_PARENT = str(Path(__file__).resolve().parent.parent)
+if _PKG_PARENT not in sys.path:
+    sys.path.insert(0, _PKG_PARENT)
+
 
 def _import_streamlit():
     try:
@@ -34,6 +41,71 @@ def _import_streamlit():
             "    pip install bib-checker[gui]\n"
         )
         sys.exit(1)
+
+
+def _pick_path(kind: str, title: str, filetypes: list | None = None) -> str:
+    """Open a native OS picker. kind is 'file', 'folder', or 'save'.
+
+    Streamlit runs locally for this tool, so tkinter dialogs appear on the
+    same machine as the user's browser. Returns "" if the user cancels.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return ""
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        root.update()
+    except Exception:
+        pass
+
+    if kind == "folder":
+        path = filedialog.askdirectory(title=title, parent=root)
+    elif kind == "save":
+        path = filedialog.asksaveasfilename(
+            title=title, parent=root, filetypes=filetypes or [],
+            defaultextension=(filetypes[0][1].split()[0].lstrip("*") if filetypes else None),
+        )
+    else:
+        path = filedialog.askopenfilename(
+            title=title, parent=root, filetypes=filetypes or [],
+        )
+    root.destroy()
+    return path or ""
+
+
+def _path_input(st, label: str, key: str, kind: str,
+                filetypes: list | None = None,
+                default: str = "",
+                help: str | None = None,
+                button_label: str = "Browse") -> str:
+    """Text input + Browse button that opens a native picker.
+
+    Uses a pending-key trick so we can update the input value from a button
+    without violating Streamlit's "don't mutate a live widget" rule.
+    """
+    pending_key = f"_{key}_pending"
+    if pending_key in st.session_state:
+        st.session_state[key] = st.session_state.pop(pending_key)
+    elif key not in st.session_state and default:
+        st.session_state[key] = default
+
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        value = st.text_input(label, key=key, help=help)
+    with col2:
+        # Vertical alignment with the text input
+        st.write("")
+        if st.button(button_label, key=f"{key}_browse_btn", width="stretch"):
+            picked = _pick_path(kind, title=label)
+            if picked:
+                st.session_state[pending_key] = picked
+                st.rerun()
+    return value
 
 
 def main():
@@ -61,15 +133,21 @@ def main():
         )
 
         if mode == "LaTeX file":
-            tex_path = st.text_input("Path to .tex file",
-                                     value=st.session_state.get("tex_path", ""))
+            tex_path = _path_input(
+                st, "Path to .tex file", key="tex_path",
+                kind="file", filetypes=[("LaTeX", "*.tex"), ("All files", "*.*")],
+            )
         elif mode == "LaTeX folder (recursive)":
-            tex_path = st.text_input("Path to LaTeX folder",
-                                     value=st.session_state.get("tex_path", ""),
-                                     help="All .tex files under this folder will be scanned (Figures/ excluded).")
+            tex_path = _path_input(
+                st, "Path to LaTeX folder", key="tex_path",
+                kind="folder",
+                help="All .tex files under this folder will be scanned (Figures/ excluded).",
+            )
         else:
-            tex_path = st.text_input("Path to PDF",
-                                     value=st.session_state.get("pdf_path", ""))
+            tex_path = _path_input(
+                st, "Path to PDF", key="tex_path",
+                kind="file", filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
+            )
 
         # Suggest a .bib path next to the input
         suggested_bib = ""
@@ -86,9 +164,13 @@ def main():
                 elif mode == "PDF (via GROBID)":
                     suggested_bib = str(p.with_suffix(".bib"))
 
-        bib_path = st.text_input(
-            "Path to .bib file",
-            value=st.session_state.get("bib_path", suggested_bib),
+        # In PDF mode, the bib is an output (save dialog). Otherwise, an existing file.
+        bib_kind = "save" if mode == "PDF (via GROBID)" else "file"
+        bib_path = _path_input(
+            st, "Path to .bib file", key="bib_path",
+            kind=bib_kind,
+            filetypes=[("BibTeX", "*.bib"), ("All files", "*.*")],
+            default=suggested_bib,
             help="For PDF mode, this is where the extracted bib will be saved.",
         )
 
@@ -99,7 +181,12 @@ def main():
                 report_default = str(p / "alignment_report.md")
             else:
                 report_default = str(p.with_suffix(".alignment.md"))
-        report_path = st.text_input("Output report (.md)", value=report_default)
+        report_path = _path_input(
+            st, "Output report (.md)", key="report_path",
+            kind="save",
+            filetypes=[("Markdown", "*.md"), ("All files", "*.*")],
+            default=report_default,
+        )
 
         st.markdown("---")
         st.header("Options")
@@ -156,7 +243,7 @@ def main():
             disabled=(mode != "PDF (via GROBID)"),
         )
 
-        run_button = st.button("Run check", type="primary", use_container_width=True)
+        run_button = st.button("Run check", type="primary", width="stretch")
 
     # ------------------------------------------------------------------
     # Run
@@ -165,23 +252,25 @@ def main():
         st.info("Configure the run in the sidebar and click **Run check**.")
         return
 
-    # Persist inputs
-    st.session_state["tex_path"] = tex_path
-    st.session_state["bib_path"] = bib_path
+    # Widget keys (tex_path / bib_path / report_path) already persist across
+    # reruns via Streamlit's session_state, so no explicit copy is needed here.
 
     if not tex_path or not Path(tex_path).exists():
         st.error("Source file/folder not found.")
         return
 
-    # Local imports so the GUI can start even when optional extras are missing
-    from .parser import parse_bib, extract_citations, extract_citations_from_dir
-    from .verify import verify_all  # noqa: F401 (kept for parity)
-    from .abstracts import fetch_and_add_abstracts
-    from .alignment import (
+    # Absolute imports — `streamlit run gui.py` executes this file as a
+    # top-level script, so relative imports (`from .parser ...`) would fail.
+    from bib_checker.parser import (
+        parse_bib, extract_citations, extract_citations_from_dir,
+    )
+    from bib_checker.verify import verify_all  # noqa: F401 (kept for parity)
+    from bib_checker.abstracts import fetch_and_add_abstracts
+    from bib_checker.alignment import (
         check_alignment, llm_review_results, add_polarity_check,
         generate_report,
     )
-    from .llm_review import make_client
+    from bib_checker.llm_review import make_client
 
     progress = st.progress(0, text="Starting...")
     log = st.expander("Log", expanded=True)
@@ -190,7 +279,7 @@ def main():
     try:
         # Stage 1: extract / parse citations
         if mode == "PDF (via GROBID)":
-            from . import pdf_extract
+            from bib_checker import pdf_extract
             progress.progress(10, text="Extracting bibliography from PDF (GROBID)...")
             entries, citations, diagnostics = pdf_extract.extract_from_pdf(
                 tex_path, base_url=grobid_url
@@ -267,7 +356,7 @@ def main():
                 "title": r.get("title", ""),
                 "note": r.get("reason", ""),
             })
-        st.dataframe(rows, use_container_width=True, height=400)
+        st.dataframe(rows, width="stretch", height=400)
 
         if diagnostics:
             with st.expander(

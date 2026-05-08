@@ -26,7 +26,8 @@ setup(
         ],
         # Browser GUI
         "gui": [
-            "streamlit>=1.30",
+            "streamlit>=1.40",
+            "starlette>=0.40",
         ],
         # Large bib libraries (>10k entries). Optional even at scale; numpy is
         # plenty fast under that threshold.
@@ -37,7 +38,8 @@ setup(
         "all": [
             "sentence-transformers>=2.7",
             "lxml>=5.0",
-            "streamlit>=1.30",
+            "streamlit>=1.40",
+            "starlette>=0.40",
         ],
     },
     entry_points={

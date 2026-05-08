@@ -13,3 +13,4 @@ venv/
 *.log
 .mypy_cache/
 .pytest_cache/
+LINKEDIN_POST.md
