@@ -90,6 +90,75 @@ def parse_bib_dir(bib_dir: str) -> dict:
     return merged
 
 
+def load_bibs_smart(
+    bib_arg: str,
+    tex_arg: str | None = None,
+    tex_only: bool = False,
+) -> tuple[dict, str]:
+    """Resolve a bib path to (merged_entries, primary_path).
+
+    Default behaviour (``tex_only=False``): a single .bib file uses just that
+    file; a directory merges *every* .bib found under it (recursively), with
+    a field-level merge on duplicate keys — existing fields are kept,
+    missing ones are filled from the next .bib that has them. .tex-referenced
+    bibs are placed first in the merge order so their data takes precedence
+    on collisions.
+
+    Strict mode (``tex_only=True``): only the .bib files actually referenced
+    via ``\\bibliography{}`` / ``\\addbibresource{}`` in the .tex source are
+    loaded; other .bib files are ignored. Useful if you maintain a personal
+    reference library alongside the project bib and want to avoid pulling
+    in irrelevant entries.
+
+    Lives here so the CLI and the GUI share the same logic.
+    """
+    p = Path(bib_arg)
+    if p.is_file():
+        return parse_bib(str(p)), str(p)
+    if not p.is_dir():
+        raise FileNotFoundError(f"{bib_arg} not found")
+
+    tex_refs: list[Path] = find_bib_paths_from_tex(tex_arg) if tex_arg else []
+
+    if tex_only:
+        if not tex_refs:
+            raise FileNotFoundError(
+                f"--tex-bib-only set but no \\bibliography or \\addbibresource "
+                f"references found in {tex_arg}"
+            )
+        ordered = tex_refs
+    else:
+        # All .bib files anywhere under the directory; tex-referenced ones
+        # appear first so they take precedence on field-merge ties.
+        seen: set = set()
+        ordered = []
+        for b in tex_refs:
+            key = b.resolve()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(b)
+        for b in sorted(p.rglob("*.bib")):
+            key = b.resolve()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(b)
+        if not ordered:
+            raise FileNotFoundError(f"No .bib files found under {p}")
+
+    merged: dict = {}
+    for bib_file in ordered:
+        for k, v in parse_bib(str(bib_file)).items():
+            if k not in merged:
+                merged[k] = dict(v)
+            else:
+                existing = merged[k]
+                for fk, fv in v.items():
+                    if fv and not existing.get(fk):
+                        existing[fk] = fv
+    primary = tex_refs[0] if tex_refs else ordered[0]
+    return merged, str(primary)
+
+
 def find_bib_paths_from_tex(
     tex_path: str,
     exclude_dirs: tuple = ("Figures", "figures"),

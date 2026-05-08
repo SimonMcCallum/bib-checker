@@ -149,30 +149,49 @@ def main():
                 kind="file", filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
             )
 
-        # Suggest a .bib path next to the input
+        # Suggest the project folder so EVERY .bib in it gets merged by
+        # default. Users can browse to a single .bib to narrow it down,
+        # or tick "Restrict to .tex-referenced bibs" below.
         suggested_bib = ""
         if tex_path:
             p = Path(tex_path)
             if p.is_dir():
-                bibs = list(p.glob("*.bib"))
-                if bibs:
-                    suggested_bib = str(bibs[0])
+                suggested_bib = str(p)
             elif p.is_file():
-                bibs = list(p.parent.glob("*.bib"))
-                if bibs:
-                    suggested_bib = str(bibs[0])
-                elif mode == "PDF (via GROBID)":
+                suggested_bib = str(p.parent)
+                if mode == "PDF (via GROBID)":
                     suggested_bib = str(p.with_suffix(".bib"))
 
-        # In PDF mode, the bib is an output (save dialog). Otherwise, an existing file.
-        bib_kind = "save" if mode == "PDF (via GROBID)" else "file"
-        bib_path = _path_input(
-            st, "Path to .bib file", key="bib_path",
-            kind=bib_kind,
-            filetypes=[("BibTeX", "*.bib"), ("All files", "*.*")],
-            default=suggested_bib,
-            help="For PDF mode, this is where the extracted bib will be saved.",
-        )
+        # In PDF mode, the bib is an output (save dialog). Otherwise, allow
+        # either a single .bib file *or* a folder containing .bib files.
+        # Default is the project folder so every .bib gets merged.
+        if mode == "PDF (via GROBID)":
+            bib_path = _path_input(
+                st, "Path to .bib file", key="bib_path", kind="save",
+                filetypes=[("BibTeX", "*.bib"), ("All files", "*.*")],
+                default=suggested_bib,
+                help="Where the extracted bib will be saved.",
+            )
+        else:
+            bib_path = _path_input(
+                st, "Path to .bib file or folder", key="bib_path", kind="folder",
+                default=suggested_bib,
+                help="Default is the project folder — every .bib file under it is merged "
+                     "(so abstracts in one bib fill in titles from another). Browse opens "
+                     "a folder picker; you can also paste a path to a single .bib file to "
+                     "use just that one.",
+                button_label="Browse folder",
+            )
+
+        tex_bib_only = False
+        if mode != "PDF (via GROBID)":
+            tex_bib_only = st.checkbox(
+                "Restrict to .bib files referenced by the .tex",
+                value=False,
+                help="Off (default): merge every .bib under the folder. "
+                     "On: only use .bib files explicitly referenced via "
+                     r"\bibliography{} or \addbibresource{} in the LaTeX.",
+            )
 
         report_default = ""
         if tex_path:
@@ -191,13 +210,20 @@ def main():
         st.markdown("---")
         st.header("Options")
 
-        # Scoring
+        st.subheader("Citation alignment")
         scorer = st.selectbox(
             "Similarity scorer",
             ["embedding", "tfidf"],
             help="embedding: local sentence-transformer (semantic). tfidf: lexical, no model needed.",
         )
-        threshold = st.slider("Flag below similarity", 0.0, 1.0, 0.30, 0.01)
+        ok_threshold = st.slider(
+            "OK floor", 0.0, 1.0, 0.30, 0.01,
+            help="Scores >= this are OK.",
+        )
+        flag_threshold = st.slider(
+            "FLAG ceiling", 0.0, 1.0, 0.20, 0.01,
+            help="Scores < this are FLAG. Scores between FLAG ceiling and OK floor are CHECK.",
+        )
 
         # Toggles
         fetch_missing = st.checkbox(
@@ -214,6 +240,26 @@ def main():
         polarity_threshold = st.slider(
             "NLI polarity flag threshold", 0.0, 1.0, 0.30, 0.05,
             disabled=not check_polarity,
+        )
+
+        st.subheader("Citation suggestions")
+        suggest_missing = st.checkbox(
+            "Scan document for sentences that lack a strong citation",
+            value=False,
+            help="Walks every sentence in the source, encodes it, and suggests "
+                 "the best-matching bib entries. Highlights sentences whose top "
+                 "match isn't currently cited there. LaTeX modes only.",
+            disabled=(mode == "PDF (via GROBID)"),
+        )
+        suggestion_threshold = st.slider(
+            "Suggestion threshold (top-1 score must exceed)",
+            0.0, 1.0, 0.55, 0.01,
+            disabled=not suggest_missing,
+            help="Lower for more (noisier) suggestions; higher for stricter.",
+        )
+        suggestion_top_k = st.slider(
+            "Candidates to show per sentence", 1, 5, 3, 1,
+            disabled=not suggest_missing,
         )
 
         # LLM
@@ -262,7 +308,7 @@ def main():
     # Absolute imports — `streamlit run gui.py` executes this file as a
     # top-level script, so relative imports (`from .parser ...`) would fail.
     from bib_checker.parser import (
-        parse_bib, extract_citations, extract_citations_from_dir,
+        parse_bib, load_bibs_smart, extract_citations, extract_citations_from_dir,
     )
     from bib_checker.verify import verify_all  # noqa: F401 (kept for parity)
     from bib_checker.abstracts import fetch_and_add_abstracts
@@ -271,6 +317,7 @@ def main():
         generate_report,
     )
     from bib_checker.llm_review import make_client
+    from bib_checker import suggest_doc as sd
 
     progress = st.progress(0, text="Starting...")
     log = st.expander("Log", expanded=True)
@@ -290,10 +337,12 @@ def main():
         else:
             progress.progress(10, text="Parsing bibliography...")
             if not bib_path or not Path(bib_path).exists():
-                st.error("Bibliography file not found.")
+                st.error("Bibliography file/folder not found.")
                 return
-            entries = parse_bib(bib_path)
-            log.write(f"Parsed {len(entries)} bib entries")
+            # Multi-bib aware load: when bib_path is a directory, merges all
+            # .tex-referenced bibs plus any others under it (field-level merge).
+            entries, primary_bib = load_bibs_smart(bib_path, tex_arg=tex_path, tex_only=tex_bib_only)
+            log.write(f"Parsed {len(entries)} bib entries (primary: {primary_bib})")
 
             progress.progress(20, text="Extracting citation contexts...")
             if mode == "LaTeX folder (recursive)":
@@ -307,13 +356,20 @@ def main():
 
         # Stage 2: optional abstract fetch
         if fetch_missing and bib_path:
-            progress.progress(35, text="Fetching missing abstracts...")
-            fetch_and_add_abstracts(bib_path, delay=1.0)
-            entries = parse_bib(bib_path)
+            progress.progress(35, text="Fetching missing abstracts (cited entries only)...")
+            cited = set(citations.keys()) if citations else None
+            fetch_target = primary_bib if mode != "PDF (via GROBID)" else bib_path
+            fetch_and_add_abstracts(fetch_target, delay=1.0, cited_keys=cited)
+            entries, _ = load_bibs_smart(bib_path, tex_arg=tex_path, tex_only=tex_bib_only) if mode != "PDF (via GROBID)" else (parse_bib(bib_path), bib_path)
 
         # Stage 3: alignment
         progress.progress(60, text=f"Scoring alignment ({scorer})...")
-        results = check_alignment(citations, entries, threshold=threshold, scorer=scorer)
+        results = check_alignment(
+            citations, entries,
+            threshold=ok_threshold,
+            flag_threshold=flag_threshold,
+            scorer=scorer,
+        )
 
         # Stage 4: optional NLI polarity check
         if check_polarity:
@@ -326,7 +382,22 @@ def main():
             client = make_client(llm_provider, model=(llm_model or None))
             llm_review_results(results, entries, client, review_all=llm_all)
 
-        # Stage 6: report
+        # Stage 6: optional citation-suggestion pass
+        suggestions: list[dict] = []
+        if suggest_missing and mode != "PDF (via GROBID)":
+            progress.progress(90, text="Scanning sentences for missing citations...")
+            sentences = sd.extract_sentences(tex_path)
+            log.write(
+                f"Extracted {len(sentences)} sentences for suggestion scoring"
+            )
+            suggestions = sd.suggest_citations(
+                sentences, entries,
+                threshold=suggestion_threshold,
+                top_k=suggestion_top_k,
+                only_missing=True,
+            )
+
+        # Stage 7: report
         progress.progress(95, text="Writing report...")
         if report_path:
             generate_report(
@@ -335,24 +406,43 @@ def main():
                 diagnostics=diagnostics,
             )
             log.write(f"Report written to {report_path}")
+            if suggestions:
+                # Drop the suggestion report next to the alignment report.
+                sug_path = str(Path(report_path).with_name(
+                    Path(report_path).stem + "_suggestions.md"
+                ))
+                sd.write_markdown_report(
+                    suggestions, entries, sug_path,
+                    threshold=suggestion_threshold,
+                )
+                log.write(f"Suggestion report written to {sug_path}")
 
         progress.progress(100, text="Done.")
 
         # ----- display -----
-        flagged = [r for r in results if r.get("flagged")]
-        st.subheader(f"Results: {len(results)} cited keys, {len(flagged)} flagged")
+        # Status counts
+        counts = {"ok": 0, "check": 0, "flag": 0, "no_data": 0}
+        for r in results:
+            s = r.get("status", "ok" if r.get("keyword_score") is not None else "no_data")
+            counts[s] = counts.get(s, 0) + 1
 
-        # Build a plain dict-of-rows for the dataframe
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("OK", counts["ok"])
+        col2.metric("Check", counts["check"])
+        col3.metric("Flag", counts["flag"])
+        col4.metric("No data", counts["no_data"])
+
+        st.subheader(f"All citations ({len(results)})")
         rows = []
         for r in results:
             rows.append({
+                "status": r.get("status", "ok" if r.get("keyword_score") is not None else "no_data"),
                 "key": r["key"],
                 "embed": r.get("embedding_score"),
                 "tfidf": r.get("tfidf_score"),
                 "nli_polarity": r.get("nli_polarity"),
                 "nli_label": r.get("nli_label"),
                 "llm": (r.get("llm_verdict") or {}).get("verdict") if r.get("llm_verdict") else None,
-                "flagged": r.get("flagged", False),
                 "title": r.get("title", ""),
                 "note": r.get("reason", ""),
             })
@@ -375,39 +465,99 @@ def main():
                     st.write("**Unresolved inline citations (cited, missing from bib)**:",
                              diagnostics["unresolved_inline"])
 
-        if flagged:
-            with st.expander(f"Flagged citations ({len(flagged)})", expanded=True):
-                for r in flagged:
-                    st.markdown(f"### `{r['key']}`")
-                    st.markdown(f"**Title**: {r['title']}")
-                    if r.get("embedding_score") is not None:
-                        st.markdown(f"**Embedding similarity**: {r['embedding_score']:.3f}")
-                    if r.get("nli_polarity") is not None:
-                        st.markdown(
-                            f"**NLI**: {r['nli_label']} "
-                            f"(polarity {r['nli_polarity']:+.3f})"
-                        )
-                    v = r.get("llm_verdict")
-                    if v:
-                        st.markdown(
-                            f"**LLM verdict**: {v.get('verdict')} — {v.get('reason')}"
-                        )
-                    if r.get("best_snippet"):
-                        st.markdown(
-                            f"**Best-matching sentence in cited paper**: _{r['best_snippet']}_"
-                        )
-                    st.markdown("**Citation context(s)**:")
-                    for ctx in r["contexts"][:3]:
-                        st.markdown(f"> {ctx[:400]}")
-                    st.markdown("---")
+        def _render_citation_block(r):
+            st.markdown(f"### `{r['key']}`")
+            st.markdown(f"**Title**: {r['title']}")
+            if r.get("embedding_score") is not None:
+                st.markdown(f"**Embedding similarity**: {r['embedding_score']:.3f}")
+            if r.get("nli_polarity") is not None:
+                st.markdown(
+                    f"**NLI**: {r['nli_label']} "
+                    f"(polarity {r['nli_polarity']:+.3f})"
+                )
+            v = r.get("llm_verdict")
+            if v:
+                st.markdown(f"**LLM verdict**: {v.get('verdict')} — {v.get('reason')}")
+            if r.get("best_snippet"):
+                st.markdown(f"**Best-matching sentence in cited paper**: _{r['best_snippet']}_")
+            st.markdown("**Citation context(s)**:")
+            for ctx in r["contexts"][:3]:
+                st.markdown(f"> {ctx[:400]}")
+            st.markdown("---")
 
+        flag_results = [r for r in results if r.get("status") == "flag"]
+        check_results = [r for r in results if r.get("status") == "check"]
+        if flag_results:
+            with st.expander(f"FLAG ({len(flag_results)})", expanded=True):
+                for r in flag_results:
+                    _render_citation_block(r)
+        if check_results:
+            with st.expander(f"CHECK ({len(check_results)})", expanded=False):
+                for r in check_results:
+                    _render_citation_block(r)
+
+        # ---- Citation suggestions ----
+        if suggestions:
+            st.subheader(
+                f"Citation suggestions ({len(suggestions)} sentences "
+                f"with score >= {suggestion_threshold:.2f})"
+            )
+            sug_rows = [
+                {
+                    "score": s["best_score"],
+                    "file": Path(s["file"]).name,
+                    "suggested_key": s["suggestions"][0]["key"],
+                    "currently_cited": ", ".join(s.get("cite_keys") or []) or "—",
+                    "sentence": s["raw"][:200].replace("\n", " "),
+                }
+                for s in sorted(suggestions, key=lambda x: -x["best_score"])
+            ]
+            st.dataframe(sug_rows, width="stretch", height=300)
+
+            with st.expander("Per-sentence detail with top suggestions", expanded=False):
+                for s in sorted(suggestions, key=lambda x: -x["best_score"])[:50]:
+                    st.markdown(
+                        f"**{Path(s['file']).name}** — score {s['best_score']:.3f}"
+                    )
+                    st.markdown(f"> {s['raw'][:500]}")
+                    existing = s.get("cite_keys") or []
+                    if existing:
+                        st.markdown(f"_Already cites: {', '.join(existing)}_")
+                    else:
+                        st.markdown("_No citation in this sentence._")
+                    for sug in s["suggestions"]:
+                        title = entries.get(sug["key"], {}).get("title", "")
+                        marker = " — *(already cited)*" if sug["key"] in existing else ""
+                        st.markdown(f"- `{sug['key']}` ({sug['score']:.3f}) — {title}{marker}")
+                    st.markdown("---")
+        elif suggest_missing and mode != "PDF (via GROBID)":
+            st.info(
+                f"No sentences scored above the suggestion threshold "
+                f"({suggestion_threshold:.2f}). Try lowering the slider."
+            )
+        elif suggest_missing and mode == "PDF (via GROBID)":
+            st.warning("Citation suggestions are only available in LaTeX modes for now.")
+
+        # ---- Downloads ----
+        cols = st.columns(2)
         if report_path and Path(report_path).exists():
-            st.download_button(
-                "Download markdown report",
+            cols[0].download_button(
+                "Download alignment report",
                 Path(report_path).read_text(encoding="utf-8"),
                 file_name=Path(report_path).name,
                 mime="text/markdown",
             )
+        if suggestions and report_path:
+            sug_path = Path(report_path).with_name(
+                Path(report_path).stem + "_suggestions.md"
+            )
+            if sug_path.exists():
+                cols[1].download_button(
+                    "Download suggestions report",
+                    sug_path.read_text(encoding="utf-8"),
+                    file_name=sug_path.name,
+                    mime="text/markdown",
+                )
 
     except Exception as e:
         progress.empty()

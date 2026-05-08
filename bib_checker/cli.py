@@ -6,7 +6,7 @@ from pathlib import Path
 from rich.console import Console
 
 from .parser import (
-    parse_bib, parse_bib_dir, find_bib_paths_from_tex,
+    parse_bib, parse_bib_dir, find_bib_paths_from_tex, load_bibs_smart,
     extract_citations, extract_citations_from_dir,
 )
 from .verify import verify_all, print_summary
@@ -65,16 +65,17 @@ def _load_citations(tex_arg: str) -> dict:
     return extract_citations(str(p))
 
 
-def _load_bib(bib_arg: str, tex_arg: str | None = None) -> tuple[dict, str]:
+def _load_bib(
+    bib_arg: str,
+    tex_arg: str | None = None,
+    tex_only: bool = False,
+) -> tuple[dict, str]:
     """Resolve a .bib file or a directory of .bib files.
 
-    Behaviour:
-      1. If `bib_arg` points to a single .bib file, use just that.
-      2. If `bib_arg` is a directory and `tex_arg` is given, prefer .bib files
-         actually referenced via \\bibliography{} / \\addbibresource{} in the
-         LaTeX source (these may live in subfolders).
-      3. Falls back to merging every .bib under `bib_arg` if no references
-         can be discovered from the .tex.
+    Default: if `bib_arg` is a directory, every .bib under it is merged, with
+    .tex-referenced ones taking precedence on field collisions. Set
+    `tex_only=True` to *only* use the .bibs explicitly referenced from the
+    LaTeX source.
 
     Returns (entries, primary_path). The primary_path is used as the write
     target when --fetch-missing or --bib-out are enabled.
@@ -86,32 +87,13 @@ def _load_bib(bib_arg: str, tex_arg: str | None = None) -> tuple[dict, str]:
     if not p.is_dir():
         raise FileNotFoundError(f"{bib_arg} not found")
 
-    # Directory: list .bib files referenced by the LaTeX source (these may
-    # live in subfolders) AND any other .bib files directly under the dir.
-    # The .tex-referenced files take precedence (first-seen wins on key
-    # collision); the extras just fill in gaps — useful when an augmented bib
-    # (e.g. one written by --fetch-missing) hasn't been wired into the .tex
-    # yet but still carries richer data.
-    seen_paths: set = set()
-    ordered: list[Path] = []
-    tex_refs: list[Path] = []
-    if tex_arg:
-        tex_refs = find_bib_paths_from_tex(tex_arg)
-        for b in tex_refs:
-            key = b.resolve()
-            if key not in seen_paths:
-                seen_paths.add(key)
-                ordered.append(b)
-    extras = [b for b in sorted(p.rglob("*.bib")) if b.resolve() not in seen_paths]
-    for b in extras:
-        seen_paths.add(b.resolve())
-        ordered.append(b)
-    if not ordered:
-        raise FileNotFoundError(f"No .bib files found under {p}")
-
-    if tex_refs:
+    # Print a quick listing for transparency, then defer to load_bibs_smart
+    # for the actual loading + field-merge (shared with the GUI).
+    tex_refs = find_bib_paths_from_tex(tex_arg) if tex_arg else []
+    if tex_only:
         console.print(
-            f"[dim]Bib files referenced by .tex ({len(tex_refs)}):[/dim]"
+            f"[dim]--tex-bib-only: using only .bib files referenced by the .tex "
+            f"({len(tex_refs)}):[/dim]"
         )
         for b in tex_refs:
             try:
@@ -119,39 +101,27 @@ def _load_bib(bib_arg: str, tex_arg: str | None = None) -> tuple[dict, str]:
             except ValueError:
                 rel = b
             console.print(f"  [dim]- {rel}[/dim]")
-    if extras:
+    else:
+        all_bibs = sorted(p.rglob("*.bib"))
         console.print(
-            f"[dim]Other .bib files in the project ({len(extras)}, used as fallback content):[/dim]"
+            f"[dim]Loading all {len(all_bibs)} .bib file(s) under {p} "
+            f"({len(tex_refs)} referenced by .tex, take precedence on field merges):[/dim]"
         )
-        for b in extras:
+        ref_set = {b.resolve() for b in tex_refs}
+        for b in all_bibs:
             try:
                 rel = b.relative_to(p)
             except ValueError:
                 rel = b
-            console.print(f"  [dim]- {rel}[/dim]")
+            tag = " (tex-referenced)" if b.resolve() in ref_set else ""
+            console.print(f"  [dim]- {rel}{tag}[/dim]")
 
-    # Field-level merge: for each key, take the union of fields across all
-    # .bib files. The first occurrence "wins" for any field it provides, but
-    # later bibs can fill in fields the earlier ones lack — so a sparse
-    # references.bib (titles only) gets enriched by an augmented hlcc_paper.bib
-    # that has abstracts/tldrs.
-    merged: dict = {}
-    for bib_file in ordered:
-        for k, v in parse_bib(str(bib_file)).items():
-            if k not in merged:
-                merged[k] = dict(v)
-                continue
-            existing = merged[k]
-            for fk, fv in v.items():
-                if fv and not existing.get(fk):
-                    existing[fk] = fv
-    primary = tex_refs[0] if tex_refs else ordered[0]
-    return merged, str(primary)
+    return load_bibs_smart(bib_arg, tex_arg=tex_arg, tex_only=tex_only)
 
 
 def cmd_check(args):
     """Check citation-abstract alignment from a .tex source (file or directory)."""
-    entries, _ = _load_bib(args.bib, tex_arg=args.tex)
+    entries, _ = _load_bib(args.bib, tex_arg=args.tex, tex_only=getattr(args, "tex_bib_only", False))
     citations = _load_citations(args.tex)
 
     console.print(
@@ -179,7 +149,7 @@ def cmd_report(args):
     # Load the bib(s). When args.bib is a directory, every .bib in it is merged
     # (first-seen-wins). primary_bib is the file we use as the write target for
     # the --fetch-missing / --bib-out copy.
-    entries, primary_bib = _load_bib(args.bib, tex_arg=args.tex)
+    entries, primary_bib = _load_bib(args.bib, tex_arg=args.tex, tex_only=getattr(args, "tex_bib_only", False))
     bib_path = primary_bib
 
     # If --bib-out is given, work on a copy so the original .bib is untouched.
@@ -203,7 +173,7 @@ def cmd_report(args):
         fetch_and_add_abstracts(bib_path, delay=args.delay, cited_keys=cited)
         # Re-merge the directory (or just the file) so freshly-fetched abstracts
         # are visible alongside entries from sibling bibs.
-        merged_now, _ = _load_bib(args.bib, tex_arg=args.tex)
+        merged_now, _ = _load_bib(args.bib, tex_arg=args.tex, tex_only=getattr(args, "tex_bib_only", False))
         # Override with anything just written into the primary/output bib.
         merged_now.update(parse_bib(bib_path))
         entries = merged_now
@@ -285,7 +255,7 @@ def cmd_suggest_doc(args):
     """Walk a document and suggest citations for sentences that lack a strong one."""
     from . import suggest_doc
 
-    entries, _ = _load_bib(args.bib, tex_arg=args.tex)
+    entries, _ = _load_bib(args.bib, tex_arg=args.tex, tex_only=getattr(args, "tex_bib_only", False))
     sentences = suggest_doc.extract_sentences(args.tex, min_words=args.min_words)
     console.print(
         f"[bold]Scanning {len(sentences)} sentences against {len(entries)} bib entries[/bold]\n"
@@ -339,6 +309,15 @@ def main():
     p_abs = sub.add_parser("abstracts", help="Fetch and add abstracts")
     p_abs.add_argument("bib", help="Path to .bib file")
 
+    def _add_bib_args(p):
+        p.add_argument(
+            "--tex-bib-only", action="store_true",
+            help="Only use .bib files actually referenced via \\bibliography{} or "
+                 "\\addbibresource{} in the LaTeX. Default: merge every .bib file "
+                 "under the bib-arg directory (with .tex-referenced ones taking "
+                 "precedence on field collisions).",
+        )
+
     def _add_nli_args(p):
         p.add_argument("--check-polarity", action="store_true",
                        help="Run a local NLI cross-encoder to detect claim-inversion "
@@ -378,6 +357,7 @@ def main():
                               "(default 0.20)")
     p_check.add_argument("--scorer", choices=["embedding", "tfidf"], default="embedding",
                          help="Similarity method (default: embedding)")
+    _add_bib_args(p_check)
     _add_nli_args(p_check)
     _add_llm_args(p_check)
 
@@ -399,6 +379,7 @@ def main():
     p_report.add_argument("--fetch-all", action="store_true",
                           help="With --fetch-missing, also fetch for entries that aren't "
                                "cited in the .tex (slower; useful for personal libraries).")
+    _add_bib_args(p_report)
     _add_nli_args(p_report)
     _add_llm_args(p_report)
 
@@ -439,6 +420,7 @@ def main():
                       help="How many candidate citations to show per sentence (default 3)")
     p_sd.add_argument("--min-words", type=int, default=8,
                       help="Drop sentences shorter than this many words (default 8)")
+    _add_bib_args(p_sd)
     p_sd.add_argument("--include-existing", action="store_true",
                       help="Also include sentences whose top suggestion is already cited there "
                            "(off by default — only the actionable cases are reported)")
